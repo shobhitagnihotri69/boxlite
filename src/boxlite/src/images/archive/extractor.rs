@@ -575,7 +575,20 @@ impl<'a> LayerExtractor<'a> {
             }
             EntryType::Char | EntryType::Block => {
                 if !is_root {
-                    trace!("Skipping device node {} (requires root)", path.display());
+                    // Rootless extraction cannot mknod; leave a regular file placeholder
+                    // so downstream metadata passes (chmod, timestamps, xattrs) have an inode on disk.
+                    // The guest VM/container mounts its own /dev at runtime, so the placeholder is inert.
+                    fs::File::create(path).map_err(|e| {
+                        BoxliteError::Storage(format!(
+                            "Failed to create placeholder for device node {}: {}",
+                            path.display(),
+                            e
+                        ))
+                    })?;
+                    trace!(
+                        "Created placeholder for device node {} (rootless mode)",
+                        path.display()
+                    );
                     return Ok(());
                 }
                 let c_path = CString::new(path.as_os_str().as_bytes())
@@ -2561,5 +2574,39 @@ mod tests {
             !dest.join("newdir").exists(),
             "a pax-oversized entry must fail before creating parent directories"
         );
+    }
+
+    #[test]
+    fn rootless_device_node_leaves_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("extract");
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("dev/console").unwrap();
+        header.set_mode(0o600);
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_device_major(5).unwrap();
+        header.set_device_minor(1).unwrap();
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, &[][..]).unwrap();
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut extractor = LayerExtractor::new(&dest);
+        extractor
+            .extract_reader(std::io::Cursor::new(tar_data))
+            .expect("rootless extraction of device node should succeed by creating placeholder");
+        extractor.finalize().unwrap();
+
+        let console_path = dest.join("dev/console");
+        assert!(console_path.exists(), "placeholder file should exist at dev/console");
+        let meta = fs::metadata(&console_path).unwrap();
+        assert!(meta.is_file(), "placeholder should be a regular file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "permissions should match mode");
+        }
     }
 }
